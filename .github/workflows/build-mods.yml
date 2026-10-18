@@ -380,6 +380,86 @@ jobs:
           print("All build paths patched")
           '@ | python -
 
+      - name: Fix iOS Mach-O linker
+        shell: pwsh
+        run: |
+          $llvmBin = Join-Path $env:DM_LLVM "bin"
+
+          $candidates = @(
+            (Join-Path $llvmBin "ld64.lld.exe"),
+            (Join-Path $llvmBin "lld.exe"),
+            (Join-Path $llvmBin "ld.lld.exe")
+          )
+
+          $source = $candidates |
+            Where-Object { Test-Path $_ } |
+            Select-Object -First 1
+
+          if (-not $source) {
+            throw "LLVM Mach-O linker not found"
+          }
+
+          $toolBin = Join-Path $PWD "toolchain\bin"
+          New-Item -ItemType Directory -Force -Path $toolBin | Out-Null
+
+          $linker = Join-Path $toolBin "ld64.lld.exe"
+          Copy-Item -LiteralPath $source -Destination $linker -Force
+
+          $env:DM_LD64 = $linker
+          "DM_LD64=$linker" |
+            Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          Write-Host "iOS linker: $linker"
+
+          @'
+          import re
+          from pathlib import Path
+
+          files = [
+              Path("arrow/tools/build.py"),
+              Path("cheat/tools/build_cheat.py"),
+          ]
+
+          injection = (
+              "    if isinstance(cmd, list) and cmd "
+              "and cmd[0] == CLANG and '-dynamiclib' in cmd:\n"
+              "        cmd = [cmd[0], '-fuse-ld=lld', "
+              "'--ld-path=' + os.environ['DM_LD64']] + cmd[1:]\n"
+          )
+
+          for path in files:
+              source = path.read_text(encoding="utf-8")
+
+              if "'--ld-path=' + os.environ['DM_LD64']" in source:
+                  print("Already patched:", path)
+                  continue
+
+              match = re.search(
+                  r"(?m)^def run\(cmd,[^\n]*\):\r?\n",
+                  source,
+              )
+
+              if not match:
+                  raise SystemExit(
+                      "Cannot find run function: " + str(path)
+                  )
+
+              source = (
+                  source[:match.end()]
+                  + injection
+                  + source[match.end():]
+              )
+
+              path.write_text(source, encoding="utf-8")
+              print("Mach-O linker patched:", path)
+
+          print("iOS linker configuration complete")
+          '@ | python -
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Linker patch failed"
+          }
+
       - name: Prepare symbol consistency files
         shell: pwsh
         run: |
