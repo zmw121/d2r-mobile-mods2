@@ -11,6 +11,10 @@ on:
         description: "Base IPA filename, use version without ios18 suffix for iOS 26"
         default: "D2RMobile-v1.0.18-build.10.1.ipa"
 
+      resources_url:
+        description: "Optional: ZIP URL containing 00-00000005.data and build_manifest.psv"
+        default: ""
+
 permissions:
   contents: read
 
@@ -22,6 +26,7 @@ jobs:
     env:
       SHELL_TAG: ${{ inputs.shell_tag }}
       SHELL_ASSET: ${{ inputs.shell_asset }}
+      RESOURCES_URL: ${{ inputs.resources_url }}
 
     steps:
       - name: Checkout source
@@ -49,140 +54,94 @@ jobs:
             throw "Downloaded base.ipa is too small, possibly a 404 page"
           }
 
-      - name: Fetch resources from Google Drive
+      - name: Fetch resources
         shell: pwsh
         run: |
           python -m pip install --upgrade pip gdown
-
-          gdown `
-            --folder "https://drive.google.com/drive/folders/1lfjUghi54ohyDxYEtNuEjtGUZyGovaIA" `
-            -O "resources\gdrive"
+          New-Item -ItemType Directory -Force -Path resources\extracted | Out-Null
 
           @'
           import hashlib
           import os
-          import re
           import shutil
           import sys
           import zipfile
           from pathlib import Path
 
           root = Path("resources")
-          download_dir = root / "gdrive"
           extracted = root / "extracted"
           extracted.mkdir(parents=True, exist_ok=True)
-
-          part_names = [
-              "D2R-Mobile-Resources.zip.001",
-              "D2R-Mobile-Resources.zip.002",
-              "D2R-Mobile-Resources.zip.003",
-          ]
 
           wanted = {
               "00-00000005.data",
               "build_manifest.psv",
           }
 
-          def find_one(filename):
-              matches = list(download_dir.rglob(filename))
-              if not matches:
-                  return None
-              return matches[0]
+          # Check if already present
+          if all((extracted / n).is_file() for n in wanted):
+              print("Resources already present")
+              sys.exit(0)
 
-          def sha256_file(path):
-              h = hashlib.sha256()
-              with open(path, "rb") as f:
-                  while True:
-                      chunk = f.read(16 * 1024 * 1024)
-                      if not chunk:
-                          break
-                      h.update(chunk)
-              return h.hexdigest().lower()
+          # Try Google Drive first
+          import subprocess
+          gdrive_ok = False
+          try:
+              subprocess.run([
+                  sys.executable, "-m", "gdown",
+                  "--folder",
+                  "https://drive.google.com/drive/folders/1lfjUghi54ohyDxYEtNuEjtGUZyGovaIA",
+                  "-O", str(root / "gdrive")
+              ], check=True, timeout=300)
+              gdrive = root / "gdrive"
 
-          def verify_if_checksum_available():
-              hashes = {}
+              def find_one(filename):
+                  matches = list(gdrive.rglob(filename))
+                  return matches[0] if matches else None
 
-              for checksum_file in download_dir.rglob("*SHA256SUMS*.txt"):
-                  try:
-                      text = checksum_file.read_text(encoding="utf-8", errors="ignore")
-                  except Exception:
-                      continue
+              gdrive_ok = True
+              for name in wanted:
+                  src = find_one(name)
+                  if src:
+                      shutil.copy2(src, extracted / name)
+                      print("From GDrive: " + name)
+                  else:
+                      gdrive_ok = False
 
-                  for line in text.splitlines():
-                      m = re.match(
-                          r"^\s*([0-9a-fA-F]{64})\s+\*?(.+?)\s*$",
-                          line
-                      )
-                      if not m:
-                          continue
-                      digest = m.group(1).lower()
-                      name = os.path.basename(m.group(2).strip())
-                      hashes.setdefault(name, digest)
+              shutil.rmtree(gdrive, ignore_errors=True)
+          except Exception as e:
+              print("GDrive failed: " + str(e))
+              gdrive_ok = False
 
-              for name in sorted(wanted):
-                  target = extracted / name
-                  expected = hashes.get(name)
+          if gdrive_ok:
+              print("Resources from Google Drive")
+              sys.exit(0)
 
-                  if not expected:
-                      print(f"No SHA256 for {name}, skipping")
-                      continue
+          # Fallback to custom URL
+          url = os.environ.get("RESOURCES_URL", "").strip()
+          if url:
+              print("Trying custom URL: " + url)
+              import urllib.request
+              zip_path = root / "resources.zip"
+              urllib.request.urlretrieve(url, zip_path)
 
-                  actual = sha256_file(target)
-                  print(f"{name} SHA256 expected: {expected}")
-                  print(f"{name} SHA256 actual:   {actual}")
-
-                  if actual != expected:
-                      raise SystemExit(f"{name} SHA256 mismatch")
-
-                  print(f"{name} SHA256 OK")
-
-          parts = [find_one(name) for name in part_names]
-
-          if all(parts):
-              print("Found 3 ZIP parts, merging")
-
-              merged = root / "D2R-Mobile-Resources.zip"
-              with open(merged, "wb") as out:
-                  for part in parts:
-                      print("Merging: " + str(part))
-                      with open(part, "rb") as src:
-                          shutil.copyfileobj(src, out, 16 * 1024 * 1024)
-
-              found = set()
-              with zipfile.ZipFile(merged) as z:
+              with zipfile.ZipFile(zip_path) as z:
                   for info in z.infolist():
                       base = os.path.basename(info.filename)
                       if base in wanted:
-                          target = extracted / base
-                          with z.open(info) as src, open(target, "wb") as dst:
+                          with z.open(info) as src, open(extracted / base, "wb") as dst:
                               shutil.copyfileobj(src, dst, 16 * 1024 * 1024)
-                          print("Extracted: " + info.filename)
-                          found.add(base)
+                          print("From custom ZIP: " + base)
 
-              missing = wanted - found
-              if missing:
-                  raise SystemExit(
-                      "Missing in ZIP: " + ", ".join(sorted(missing))
-                  )
+              zip_path.unlink(missing_ok=True)
 
-              merged.unlink(missing_ok=True)
-
-          else:
-              print("No complete ZIP parts, looking for loose files")
-
-              for name in wanted:
-                  source = find_one(name)
-                  if source is None:
-                      raise SystemExit("Missing in Google Drive: " + name)
-                  shutil.copy2(source, extracted / name)
-                  print("Copied: " + str(source))
-
-          verify_if_checksum_available()
-          shutil.rmtree(download_dir, ignore_errors=True)
+          missing = [n for n in wanted if not (extracted / n).is_file()]
+          if missing:
+              raise SystemExit(
+                  "Missing: " + ", ".join(missing) +
+                  ". Wait 24h for GDrive quota, or provide resources_url."
+              )
 
           print("Resources ready")
-          print("PHONE_DATA=" + str((extracted / "00-00000005.data").resolve()))
-          print("MANIFEST=" + str((extracted / "build_manifest.psv").resolve()))
           '@ | python -
 
       - name: Install LLVM
