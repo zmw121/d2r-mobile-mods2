@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       shell_tag:
-        description: "基础 IPA Release 标签"
+        description: "Base IPA Release tag"
         default: "v1.0.18-build.10.1"
 
       shell_asset:
-        description: "基础 IPA 文件名，iOS 26 使用不带 ios18 后缀的版本"
+        description: "Base IPA filename, use version without ios18 suffix for iOS 26"
         default: "D2RMobile-v1.0.18-build.10.1.ipa"
 
 permissions:
@@ -24,46 +24,46 @@ jobs:
       SHELL_ASSET: ${{ inputs.shell_asset }}
 
     steps:
-      - name: 检出源码
+      - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: 安装 Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.13"
 
-      - name: 创建目录
+      - name: Create directories
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path input, resources, dist | Out-Null
           New-Item -ItemType Directory -Force -Path resources\extracted | Out-Null
 
-      - name: 下载基础 IPA
+      - name: Download base IPA
         shell: pwsh
         run: |
           $url = "https://github.com/jiayx/d2r-mobile-build/releases/download/${env:SHELL_TAG}/${env:SHELL_ASSET}"
-          Write-Host "下载基础 IPA：$url"
+          Write-Host "Downloading base IPA: $url"
           Invoke-WebRequest -Uri $url -OutFile "input\base.ipa"
 
           if ((Get-Item "input\base.ipa").Length -lt 10MB) {
-            throw "下载到的 base.ipa 太小，可能是 404 页面"
+            throw "Downloaded base.ipa is too small, possibly a 404 page"
           }
 
-      - name: 从 Google Drive 获取资源
+      - name: Fetch resources from Google Drive
         shell: pwsh
         run: |
           python -m pip install --upgrade pip gdown
 
           gdown `
             --folder "https://drive.google.com/drive/folders/1lfjUghi54ohyDxYEtNuEjtGUZyGovaIA" `
-            -O "resources\gdrive" `
-            --remaining-ok
+            -O "resources\gdrive"
 
           @'
           import hashlib
           import os
           import re
           import shutil
+          import sys
           import zipfile
           from pathlib import Path
 
@@ -124,28 +124,27 @@ jobs:
                   expected = hashes.get(name)
 
                   if not expected:
-                      print(f"没有找到 {name} 的 SHA256，跳过该校验")
+                      print(f"No SHA256 for {name}, skipping")
                       continue
 
                   actual = sha256_file(target)
-                  print(f"{name} SHA256:")
-                  print(f"  预期：{expected}")
-                  print(f"  实际：{actual}")
+                  print(f"{name} SHA256 expected: {expected}")
+                  print(f"{name} SHA256 actual:   {actual}")
 
                   if actual != expected:
-                      raise SystemExit(f"{name} SHA256 校验失败")
+                      raise SystemExit(f"{name} SHA256 mismatch")
 
                   print(f"{name} SHA256 OK")
 
           parts = [find_one(name) for name in part_names]
 
           if all(parts):
-              print("发现三个 ZIP 分卷，开始合并")
+              print("Found 3 ZIP parts, merging")
 
               merged = root / "D2R-Mobile-Resources.zip"
               with open(merged, "wb") as out:
                   for part in parts:
-                      print("合并:", part)
+                      print("Merging: " + str(part))
                       with open(part, "rb") as src:
                           shutil.copyfileobj(src, out, 16 * 1024 * 1024)
 
@@ -157,38 +156,36 @@ jobs:
                           target = extracted / base
                           with z.open(info) as src, open(target, "wb") as dst:
                               shutil.copyfileobj(src, dst, 16 * 1024 * 1024)
-                          print("已提取:", info.filename)
+                          print("Extracted: " + info.filename)
                           found.add(base)
 
               missing = wanted - found
               if missing:
                   raise SystemExit(
-                      "资源 ZIP 中缺少: " + ", ".join(sorted(missing))
+                      "Missing in ZIP: " + ", ".join(sorted(missing))
                   )
 
               merged.unlink(missing_ok=True)
 
           else:
-              print("没有发现完整 ZIP 分卷，尝试直接寻找已解压文件")
+              print("No complete ZIP parts, looking for loose files")
 
               for name in wanted:
                   source = find_one(name)
                   if source is None:
-                      raise SystemExit(
-                          "Google Drive 目录中缺少: " + name
-                      )
+                      raise SystemExit("Missing in Google Drive: " + name)
                   shutil.copy2(source, extracted / name)
-                  print("已复制:", source)
+                  print("Copied: " + str(source))
 
           verify_if_checksum_available()
           shutil.rmtree(download_dir, ignore_errors=True)
 
-          print("资源准备完成")
+          print("Resources ready")
           print("PHONE_DATA=" + str((extracted / "00-00000005.data").resolve()))
           print("MANIFEST=" + str((extracted / "build_manifest.psv").resolve()))
           '@ | python -
 
-      - name: 安装 LLVM
+      - name: Install LLVM
         shell: pwsh
         run: |
           choco install llvm --yes
@@ -212,7 +209,7 @@ jobs:
           Write-Host "LLVM: $llvmRoot"
           clang --version
 
-      - name: 修正源码路径并生成审计 TBD
+      - name: Patch source paths and generate audit TBD
         shell: pwsh
         run: |
           $env:DM_BASE_VER = $env:SHELL_TAG
@@ -244,11 +241,11 @@ jobs:
                   )
                   if n != 1:
                       raise SystemExit(
-                          f"未能修补 {path}: {pattern}"
+                          f"Failed to patch {path}: {pattern}"
                       )
 
               p.write_text(s, encoding="utf-8")
-              print("已修补:", path)
+              print("Patched: " + path)
 
           patch("arrow/tools/build.py", [
               (
@@ -333,7 +330,7 @@ jobs:
           )
 
           if not m:
-              raise SystemExit("没有找到 SYM_LIBS")
+              raise SystemExit("SYM_LIBS not found")
 
           pairs = re.findall(
               r"'(_[^']+)'\s*:\s*(LIB_\w+)",
@@ -358,7 +355,7 @@ jobs:
 
               if not syms:
                   raise SystemExit(
-                      f"SYM_LIBS 中没有 {lib} 的符号"
+                      f"No symbols for {lib} in SYM_LIBS"
                   )
 
               target = tbd_dir / filename
@@ -368,11 +365,11 @@ jobs:
               )
 
               print(
-                  f"生成审计 TBD: {target} ({len(syms)} 个符号)"
+                  f"Generated audit TBD: {target} ({len(syms)} symbols)"
               )
           '@ | python -
 
-      - name: 构建任务箭头 dylib
+      - name: Build arrow dylib
         shell: pwsh
         run: |
           $env:ARROW_DYLIB_ONLY = "1"
@@ -384,7 +381,7 @@ jobs:
 
           python arrow/tools/build.py
 
-      - name: 构建并注入金手指
+      - name: Build and inject cheat
         shell: pwsh
         run: |
           $env:DM_BASE_VER = $env:SHELL_TAG
@@ -401,23 +398,23 @@ jobs:
 
           python cheat/tools/build_cheat.py
 
-      - name: 检查最终 IPA
+      - name: Verify final IPA
         shell: pwsh
         run: |
           $ipa = Get-ChildItem "dist\*.ipa" | Select-Object -First 1
 
           if ($null -eq $ipa) {
-              throw "dist 中没有生成 IPA"
+              throw "No IPA found in dist"
           }
 
           if ($ipa.Length -lt 10MB) {
-              throw "生成的 IPA 太小，可能构建失败"
+              throw "Generated IPA is too small, build may have failed"
           }
 
-          Write-Host "最终 IPA：$($ipa.FullName)"
-          Write-Host "大小：$([math]::Round($ipa.Length / 1MB, 2)) MB"
+          Write-Host "Final IPA: $($ipa.FullName)"
+          Write-Host "Size: $([math]::Round($ipa.Length / 1MB, 2)) MB"
 
-      - name: 上传构建产物
+      - name: Upload build artifacts
         if: success()
         uses: actions/upload-artifact@v4
         with:
