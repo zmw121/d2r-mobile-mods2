@@ -158,12 +158,14 @@ jobs:
               print("Patched: " + path)
           patch("arrow/tools/build.py", [
               (r"^LLVM\s*=.*$", "LLVM = os.environ.get('DM_LLVM', r'C:/Program Files/LLVM')"),
+              (r"^CLANG\s*=.*$", "CLANG = os.path.join(LLVM, 'bin', 'clang') + ' -fuse-ld=lld'"),
               (r"^IPA_ROOT_DST\s*=.*$", "IPA_ROOT_DST = os.path.join(os.environ.get('DM_DIST', 'dist'), 'D2RMobile-arrow.ipa')"),
               (r"^ROOT_DYLIB_DST\s*=.*$", "ROOT_DYLIB_DST = os.path.join(os.environ.get('DM_DIST', 'dist'), 'dmarrow.dylib')"),
               (r"^OUT_IPA_NAME\s*=.*$", "OUT_IPA_NAME = 'D2RMobile-arrow.ipa'"),
           ])
           patch("cheat/tools/build_cheat.py", [
               (r"^LLVM\s*=.*$", "LLVM = os.environ.get('DM_LLVM', r'C:/Program Files/LLVM')"),
+              (r"^CLANG\s*=.*$", "CLANG = os.path.join(LLVM, 'bin', 'clang') + ' -fuse-ld=lld'"),
               (r"^PYTHON\s*=.*$", "PYTHON = sys.executable"),
               (r"^BASE_VER\s*=.*$", "BASE_VER = os.environ.get('DM_BASE_VER', 'v1.0.18')"),
               (r"^IPA_SRC\s*=.*$", "IPA_SRC = os.environ.get('DM_IPA_SRC', 'input/base.ipa')"),
@@ -202,15 +204,19 @@ jobs:
       - name: Build arrow dylib
         shell: pwsh
         run: |
+          $env:Path = ($env:Path -split ';' | Where-Object { $_ -notlike "*mingw*" }) -join ';'
           $env:ARROW_DYLIB_ONLY = "1"
           $env:DM_IPA_SRC = "$PWD\input\base.ipa"
           if (-not $env:DM_LLVM) {
               $env:DM_LLVM = "C:\Program Files\LLVM"
           }
+          $llvmBin = "$env:DM_LLVM\bin"
+          $env:Path = "$llvmBin;$env:Path"
           python arrow/tools/build.py
       - name: Build and inject cheat
         shell: pwsh
         run: |
+          $env:Path = ($env:Path -split ';' | Where-Object { $_ -notlike "*mingw*" }) -join ';'
           $env:DM_BASE_VER = $env:SHELL_TAG
           $env:DM_IPA_SRC = "$PWD\input\base.ipa"
           $env:DM_DIST = "$PWD\dist"
@@ -221,6 +227,8 @@ jobs:
           if (-not $env:DM_LLVM) {
               $env:DM_LLVM = "C:\Program Files\LLVM"
           }
+          $llvmBin = "$env:DM_LLVM\bin"
+          $env:Path = "$llvmBin;$env:Path"
           python cheat/tools/build_cheat.py
       - name: Verify final IPA
         shell: pwsh
