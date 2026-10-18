@@ -1,3 +1,4 @@
+
 name: Build D2R Mobile Mods
 
 on:
@@ -6,12 +7,18 @@ on:
       shell_tag:
         description: "Base IPA Release tag"
         default: "v1.0.18-build.10.1"
+        required: true
+        type: string
       shell_asset:
-        description: "Base IPA filename, use version without ios18 suffix for iOS 26"
+        description: "Base IPA filename"
         default: "D2RMobile-v1.0.18-build.10.1.ipa"
+        required: true
+        type: string
       resources_url:
-        description: "Optional: ZIP URL containing 00-00000005.data and build_manifest.psv"
+        description: "Fallback resources ZIP URL"
         default: "https://github.com/zmw121/d2r-mobile-mods2/releases/download/mods-resources/mods-resources.zip"
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -20,232 +27,562 @@ jobs:
   build:
     runs-on: windows-latest
     timeout-minutes: 180
+
     env:
       SHELL_TAG: ${{ inputs.shell_tag }}
       SHELL_ASSET: ${{ inputs.shell_asset }}
       RESOURCES_URL: ${{ inputs.resources_url }}
+      DM_BASE_VER: ${{ inputs.shell_tag }}
+      DM_IPA_SRC: ${{ github.workspace }}\input\base.ipa
+      DM_IPA_BASE: ${{ github.workspace }}\input\base.ipa
+      DM_DIST: ${{ github.workspace }}\dist
+      DM_ARROW_DYLIB: ${{ github.workspace }}\arrow\out\dmarrow.dylib
+      DM_PHONE_DIR: ${{ github.workspace }}\resources\extracted
+      DM_MANIFEST: ${{ github.workspace }}\resources\extracted\build_manifest.psv
+      DM_RATES_OUT: ${{ github.workspace }}\cheat\out
+      DM_OUT_DIR: ${{ github.workspace }}\cheat\out
+
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+
+      - name: Setup GCC
+        id: msys2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: mingw-w64-ucrt-x86_64-gcc
+
+      - name: Configure GCC
+        shell: pwsh
+        run: |
+          $msysRoot = '${{ steps.msys2.outputs.msys2-location }}'
+          $gcc = Join-Path $msysRoot 'ucrt64\bin\gcc.exe'
+
+          if (!(Test-Path $gcc)) {
+            throw "GCC not found: $gcc"
+          }
+
+          "DM_GCC=$gcc" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          Write-Host "GCC: $gcc"
+          & $gcc --version
+
       - name: Create directories
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path input, resources, dist | Out-Null
           New-Item -ItemType Directory -Force -Path resources\extracted | Out-Null
+          New-Item -ItemType Directory -Force -Path arrow\out, cheat\out | Out-Null
+
       - name: Download base IPA
         shell: pwsh
         run: |
           $url = "https://github.com/jiayx/d2r-mobile-build/releases/download/${env:SHELL_TAG}/${env:SHELL_ASSET}"
-          Write-Host "Downloading base IPA: $url"
-          Invoke-WebRequest -Uri $url -OutFile "input\base.ipa"
-          if ((Get-Item "input\base.ipa").Length -lt 10MB) {
-            throw "Downloaded base.ipa is too small, possibly a 404 page"
+
+          Write-Host "Downloading base IPA:"
+          Write-Host $url
+
+          Invoke-WebRequest -Uri $url -OutFile "input\base.ipa" -ErrorAction Stop
+
+          $ipa = Get-Item "input\base.ipa"
+
+          if ($ipa.Length -lt 10MB) {
+            throw "Base IPA is too small or invalid"
           }
-      - name: Fetch resources
+
+          Write-Host "Base IPA downloaded: $($ipa.Length) bytes"
+
+      - name: Fetch game resources
         shell: pwsh
         run: |
           python -m pip install --upgrade pip gdown
-          New-Item -ItemType Directory -Force -Path resources\extracted | Out-Null
+
           @'
-          import hashlib
           import os
           import shutil
+          import subprocess
           import sys
+          import urllib.request
           import zipfile
           from pathlib import Path
+
           root = Path("resources")
           extracted = root / "extracted"
           extracted.mkdir(parents=True, exist_ok=True)
+
           wanted = {
               "00-00000005.data",
               "build_manifest.psv",
           }
-          if all((extracted / n).is_file() for n in wanted):
-              print("Resources already present")
+
+          def missing_files():
+              return [
+                  name for name in wanted
+                  if not (extracted / name).is_file()
+                  or (extracted / name).stat().st_size == 0
+              ]
+
+          if not missing_files():
+              print("Resources already available")
               sys.exit(0)
-          import subprocess
-          gdrive_ok = False
+
+          print("Trying Google Drive resources...")
+
+          gdrive = root / "gdrive"
+          gdrive.mkdir(parents=True, exist_ok=True)
+
           try:
-              subprocess.run([
-                  sys.executable, "-m", "gdown",
-                  "--folder",
-                  "https://drive.google.com/drive/folders/1lfjUghi54ohyDxYEtNuEjtGUZyGovaIA",
-                  "-O", str(root / "gdrive")
-              ], check=True, timeout=300)
-              gdrive = root / "gdrive"
-              def find_one(filename):
-                  matches = list(gdrive.rglob(filename))
-                  return matches[0] if matches else None
-              gdrive_ok = True
-              for name in wanted:
-                  src = find_one(name)
-                  if src:
-                      shutil.copy2(src, extracted / name)
-                      print("From GDrive: " + name)
-                  else:
-                      gdrive_ok = False
-              shutil.rmtree(gdrive, ignore_errors=True)
+              subprocess.run(
+                  [
+                      sys.executable,
+                      "-m",
+                      "gdown",
+                      "--folder",
+                      "https://drive.google.com/drive/folders/1lfjUghi54ohyDxYEtNuEjtGUZyGovaIA",
+                      "-O",
+                      str(gdrive),
+                  ],
+                  check=True,
+                  timeout=600,
+              )
           except Exception as e:
-              print("GDrive failed: " + str(e))
-              gdrive_ok = False
-          if gdrive_ok:
-              print("Resources from Google Drive")
-              sys.exit(0)
-          url = os.environ.get("RESOURCES_URL", "").strip()
-          if url:
-              print("Trying custom URL: " + url)
-              import urllib.request
-              zip_path = root / "resources.zip"
-              urllib.request.urlretrieve(url, zip_path)
-              with zipfile.ZipFile(zip_path) as z:
-                  for info in z.infolist():
-                      base = os.path.basename(info.filename)
-                      if base in wanted:
-                          with z.open(info) as src, open(extracted / base, "wb") as dst:
-                              shutil.copyfileobj(src, dst, 16 * 1024 * 1024)
-                          print("From custom ZIP: " + base)
-              zip_path.unlink(missing_ok=True)
-          missing = [n for n in wanted if not (extracted / n).is_file()]
+              print("Google Drive failed:", e)
+
+          for name in list(missing_files()):
+              matches = list(gdrive.rglob(name))
+              if matches:
+                  shutil.copy2(matches[0], extracted / name)
+                  print("From Google Drive:", name)
+
+          shutil.rmtree(gdrive, ignore_errors=True)
+
+          if missing_files():
+              url = os.environ.get("RESOURCES_URL", "").strip()
+
+              if url:
+                  print("Trying fallback ZIP:", url)
+
+                  zip_path = root / "resources.zip"
+
+                  try:
+                      urllib.request.urlretrieve(url, zip_path)
+
+                      with zipfile.ZipFile(zip_path) as z:
+                          for info in z.infolist():
+                              filename = info.filename.replace("\\", "/").split("/")[-1]
+
+                              if filename not in wanted:
+                                  continue
+
+                              if filename not in missing_files():
+                                  continue
+
+                              with z.open(info) as src:
+                                  with open(extracted / filename, "wb") as dst:
+                                      shutil.copyfileobj(src, dst)
+
+                              print("From fallback ZIP:", filename)
+
+                  except Exception as e:
+                      print("Fallback ZIP failed:", e)
+
+                  finally:
+                      zip_path.unlink(missing_ok=True)
+
+          missing = missing_files()
+
           if missing:
               raise SystemExit(
-                  "Missing: " + ", ".join(missing) +
-                  ". Wait 24h for GDrive quota, or provide resources_url."
+                  "Missing required resource files: "
+                  + ", ".join(missing)
+                  + ". Check Google Drive access or resources_url."
               )
-          print("Resources ready")
+
+          for name in sorted(wanted):
+              path = extracted / name
+              print("Resource OK:", name, path.stat().st_size, "bytes")
+
+          print("All resources ready")
           '@ | python -
+
       - name: Install LLVM
         shell: pwsh
         run: |
-          choco install llvm --yes
+          choco install llvm --yes --no-progress
+
           $llvmBin = "C:\Program Files\LLVM\bin"
+
           if (!(Test-Path "$llvmBin\clang.exe")) {
-              $clang = Get-Command clang.exe
-              $llvmBin = Split-Path $clang.Source
+            $clang = Get-Command clang.exe -ErrorAction Stop
+            $llvmBin = Split-Path $clang.Source
           }
+
           $llvmRoot = Split-Path $llvmBin
-          $env:Path = "$llvmBin;$env:Path"
-          $env:DM_LLVM = $llvmRoot
+
+          if (!(Test-Path "$llvmBin\llvm-nm.exe")) {
+            throw "llvm-nm.exe not found"
+          }
+
           "DM_LLVM=$llvmRoot" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
           Write-Host "LLVM: $llvmRoot"
-          clang --version
-      - name: Patch source paths and generate audit TBD
+          & "$llvmBin\clang.exe" --version
+
+      - name: Patch build scripts
         shell: pwsh
         run: |
-          $env:DM_BASE_VER = $env:SHELL_TAG
-          $env:DM_IPA_SRC = "$PWD\input\base.ipa"
-          $env:DM_DIST = "$PWD\dist"
-          $env:DM_ARROW_DYLIB = "$PWD\arrow\out\dmarrow.dylib"
-          $env:DM_PHONE_DATA = "$PWD\resources\extracted\00-00000005.data"
-          $env:DM_MANIFEST = "$PWD\resources\extracted\build_manifest.psv"
-          $env:DM_RATES_OUT = "$PWD\cheat\out"
           @'
           import os
           import re
           from pathlib import Path
+
           root = Path.cwd()
+
           def patch(path, replacements):
-              p = root / path
-              s = p.read_text(encoding="utf-8-sig")
-              for pattern, repl in replacements:
-                  s, n = re.subn(pattern, repl, s, count=1, flags=re.M)
-                  if n != 1:
-                      raise SystemExit(f"Failed to patch {path}: {pattern}")
-              p.write_text(s, encoding="utf-8")
-              print("Patched: " + path)
+              file = root / path
+              source = file.read_text(encoding="utf-8-sig")
+
+              for pattern, replacement in replacements:
+                  source, count = re.subn(
+                      pattern,
+                      lambda m: replacement,
+                      source,
+                      count=1,
+                      flags=re.M,
+                  )
+
+                  if count != 1:
+                      raise SystemExit(
+                          f"Patch failed: {path} / {pattern}"
+                      )
+
+              file.write_text(source, encoding="utf-8")
+              print("Patched:", path)
+
           patch("arrow/tools/build.py", [
-              (r"^LLVM\s*=.*$", "LLVM = os.environ.get('DM_LLVM', r'C:/Program Files/LLVM')"),
-              (r"^CLANG\s*=.*$", "CLANG = os.path.join(LLVM, 'bin', 'clang.exe')"),
-              (r"^NM\s*=.*$", "NM = os.path.join(LLVM, 'bin', 'llvm-nm.exe')"),
-              (r"^IPA_ROOT_DST\s*=.*$", "IPA_ROOT_DST = os.path.join(os.environ.get('DM_DIST', 'dist'), 'D2RMobile-arrow.ipa')"),
-              (r"^ROOT_DYLIB_DST\s*=.*$", "ROOT_DYLIB_DST = os.path.join(os.environ.get('DM_DIST', 'dist'), 'dmarrow.dylib')"),
-              (r"^OUT_IPA_NAME\s*=.*$", "OUT_IPA_NAME = 'D2RMobile-arrow.ipa'"),
+              (
+                  r"^LLVM\s*=.*$",
+                  "LLVM = os.environ['DM_LLVM']"
+              ),
+              (
+                  r"^CLANG\s*=.*$",
+                  "CLANG = os.path.join(LLVM, 'bin', 'clang.exe')"
+              ),
+              (
+                  r"^NM\s*=.*$",
+                  "NM = os.path.join(LLVM, 'bin', 'llvm-nm.exe')"
+              ),
+              (
+                  r"^GCC\s*=.*$",
+                  "GCC = os.environ['DM_GCC']"
+              ),
+              (
+                  r"^IPA_ROOT_DST\s*=.*$",
+                  "IPA_ROOT_DST = os.path.join(os.environ['DM_DIST'], 'D2RMobile-arrow.ipa')"
+              ),
+              (
+                  r"^ROOT_DYLIB_DST\s*=.*$",
+                  "ROOT_DYLIB_DST = os.path.join(os.environ['DM_DIST'], 'dmarrow.dylib')"
+              ),
+              (
+                  r"^OUT_IPA_NAME\s*=.*$",
+                  "OUT_IPA_NAME = 'D2RMobile-arrow.ipa'"
+              ),
           ])
+
           patch("cheat/tools/build_cheat.py", [
-              (r"^LLVM\s*=.*$", "LLVM = os.environ.get('DM_LLVM', r'C:/Program Files/LLVM')"),
-              (r"^CLANG\s*=.*$", "CLANG = os.path.join(LLVM, 'bin', 'clang.exe')"),
-              (r"^NM\s*=.*$", "NM = os.path.join(LLVM, 'bin', 'llvm-nm.exe')"),
-              (r"^ARROW_TOOLS\s*=.*$", "ARROW_TOOLS = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'arrow', 'tools')"),
-              (r"^TBD_DIR\s*=.*$", "TBD_DIR = os.path.join(ARROW_TOOLS, 'ios27_tbds')"),
-              (r"^PYTHON\s*=.*$", "PYTHON = sys.executable"),
-              (r"^BASE_VER\s*=.*$", "BASE_VER = os.environ.get('DM_BASE_VER', 'v1.0.18')"),
-              (r"^IPA_SRC\s*=.*$", "IPA_SRC = os.environ.get('DM_IPA_SRC', 'input/base.ipa')"),
-              (r"^IPA_ROOT_DST\s*=.*$", "IPA_ROOT_DST = os.path.join(os.environ.get('DM_DIST', 'dist'), 'D2RMobile-' + BASE_VER + '-mods-1p.ipa')"),
-              (r"^ROOT_DYLIB_DST\s*=.*$", "ROOT_DYLIB_DST = os.path.join(os.environ.get('DM_DIST', 'dist'), 'dmcheat.dylib')"),
-              (r"^ARROW_ROOT_DST\s*=.*$", "ARROW_ROOT_DST = os.path.join(os.environ.get('DM_DIST', 'dist'), 'dmarrow.dylib')"),
-              (r"^ARROW_DYLIB\s*=.*$", "ARROW_DYLIB = os.environ.get('DM_ARROW_DYLIB', 'arrow/out/dmarrow.dylib')"),
-              (r"^OUT_IPA_NAME\s*=.*$", "OUT_IPA_NAME = 'D2RMobile-' + BASE_VER + '-mods-1p.ipa'"),
+              (
+                  r"^LLVM\s*=.*$",
+                  "LLVM = os.environ['DM_LLVM']"
+              ),
+              (
+                  r"^CLANG\s*=.*$",
+                  "CLANG = os.path.join(LLVM, 'bin', 'clang.exe')"
+              ),
+              (
+                  r"^NM\s*=.*$",
+                  "NM = os.path.join(LLVM, 'bin', 'llvm-nm.exe')"
+              ),
+              (
+                  r"^ARROW_TOOLS\s*=.*$",
+                  "ARROW_TOOLS = os.path.join(os.path.dirname(CHEAT), 'arrow', 'tools')"
+              ),
+              (
+                  r"^PYTHON\s*=.*$",
+                  "PYTHON = sys.executable"
+              ),
+              (
+                  r"^BASE_VER\s*=.*$",
+                  "BASE_VER = os.environ['DM_BASE_VER']"
+              ),
+              (
+                  r"^IPA_SRC\s*=.*$",
+                  "IPA_SRC = os.environ['DM_IPA_SRC']"
+              ),
+              (
+                  r"^ARROW_DYLIB\s*=.*$",
+                  "ARROW_DYLIB = os.environ['DM_ARROW_DYLIB']"
+              ),
+              (
+                  r"^ARROW_ROOT_DST\s*=.*$",
+                  "ARROW_ROOT_DST = os.path.join(os.environ['DM_DIST'], 'dmarrow.dylib')"
+              ),
+              (
+                  r"^IPA_ROOT_DST\s*=.*$",
+                  "IPA_ROOT_DST = os.path.join(os.environ['DM_DIST'], 'D2RMobile-' + BASE_VER + '-mods-1p.ipa')"
+              ),
+              (
+                  r"^ROOT_DYLIB_DST\s*=.*$",
+                  "ROOT_DYLIB_DST = os.path.join(os.environ['DM_DIST'], 'dmcheat.dylib')"
+              ),
+              (
+                  r"^OUT_IPA_NAME\s*=.*$",
+                  "OUT_IPA_NAME = 'D2RMobile-' + BASE_VER + '-mods-1p.ipa'"
+              ),
           ])
+
           patch("cheat/tools/make_rates_overlay.py", [
-              (r"^PHONE_DATA\s*=.*$", "PHONE_DATA = os.environ.get('DM_PHONE_DATA', 'resources/extracted/00-00000005.data')"),
-              (r"^MANIFEST\s*=.*$", "MANIFEST = os.environ.get('DM_MANIFEST', 'resources/extracted/build_manifest.psv')"),
-              (r"^OUT\s*=.*$", "OUT = os.environ.get('DM_RATES_OUT', os.path.abspath('cheat/out'))"),
+              (
+                  r"^PHONE_DATA\s*=.*$",
+                  "PHONE_DATA = os.environ['DM_PHONE_DIR']"
+              ),
+              (
+                  r"^MANIFEST\s*=.*$",
+                  "MANIFEST = os.environ['DM_MANIFEST']"
+              ),
+              (
+                  r"^OUT\s*=.*$",
+                  "OUT = os.environ['DM_OUT_DIR']"
+              ),
           ])
-          p = root / "cheat/tools/build_cheat.py"
-          s = p.read_text(encoding="utf-8")
-          m = re.search(r"^SYM_LIBS\s*=\s*\{(.*?)^\}", s, re.S | re.M)
-          if not m:
+
+          patch("cheat/tools/verify_overlay.py", [
+              (
+                  r"^PHONE_DATA\s*=.*$",
+                  "PHONE_DATA = os.environ['DM_PHONE_DIR']"
+              ),
+          ])
+
+          patch("cheat/tools/check_final_ipa.py", [
+              (
+                  r"^IPA_NEW\s*=.*$",
+                  "IPA_NEW = os.path.join(os.environ['DM_DIST'], 'D2RMobile-' + BASE_VER + '-mods-1p.ipa')"
+              ),
+          ])
+
+          print("All build paths patched")
+          '@ | python -
+
+      - name: Prepare symbol consistency files
+        shell: pwsh
+        run: |
+          @'
+          import re
+          from pathlib import Path
+
+          root = Path.cwd()
+          source_path = root / "cheat/tools/build_cheat.py"
+          text = source_path.read_text(encoding="utf-8")
+
+          match = re.search(
+              r"^SYM_LIBS\s*=\s*\{(.*?)^\}",
+              text,
+              re.S | re.M,
+          )
+
+          if not match:
               raise SystemExit("SYM_LIBS not found")
-          pairs = re.findall(r"'(_[^']+)'\s*:\s*(LIB_\w+)", m.group(1))
-          files = {
+
+          pairs = re.findall(
+              r"'(_[^']+)'\s*:\s*(LIB_\w+)",
+              match.group(1),
+          )
+
+          mapping = {
               "LIB_SYSTEM": "libSystem.B.tbd",
               "LIB_OBJC": "libobjc.A.tbd",
               "LIB_FOUNDATION": "Foundation.tbd",
           }
-          tbd_dir = root / "arrow/tools/ios27_tbds"
-          tbd_dir.mkdir(parents=True, exist_ok=True)
-          for lib, filename in files.items():
-              syms = sorted({sym for sym, target in pairs if target == lib})
-              if not syms:
-                  raise SystemExit(f"No symbols for {lib} in SYM_LIBS")
-              target = tbd_dir / filename
-              target.write_text("\n".join(syms) + "\n", encoding="utf-8")
-              print(f"Generated audit TBD: {target} ({len(syms)} symbols)")
+
+          directory = root / "arrow/tools/ios27_tbds"
+          directory.mkdir(parents=True, exist_ok=True)
+
+          for library, filename in mapping.items():
+              symbols = sorted({
+                  symbol
+                  for symbol, target in pairs
+                  if target == library
+              })
+
+              if not symbols:
+                  raise SystemExit(
+                      "No registered symbols for " + library
+                  )
+
+              destination = directory / filename
+              destination.write_text(
+                  "\n".join(symbols) + "\n",
+                  encoding="utf-8",
+              )
+
+              print(
+                  "Registry consistency list:",
+                  filename,
+                  len(symbols),
+                  "symbols",
+              )
+
+          # Generated lists are not official Apple SDK files.
+          text = source_path.read_text(encoding="utf-8")
+          text = text.replace(
+              "审计（iPhoneOS 27.0 官方 tbd）",
+              "登记表一致性检查（非官方 SDK 审计）",
+          )
+          source_path.write_text(text, encoding="utf-8")
+
+          print("Symbol consistency files ready")
           '@ | python -
+
+      - name: Validate build configuration
+        shell: pwsh
+        run: |
+          $required = @(
+            "input\base.ipa",
+            "resources\extracted\00-00000005.data",
+            "resources\extracted\build_manifest.psv",
+            "arrow\tools\build.py",
+            "cheat\tools\build_cheat.py"
+          )
+
+          foreach ($file in $required) {
+            if (!(Test-Path $file)) {
+              throw "Required file missing: $file"
+            }
+
+            Write-Host "OK: $file"
+          }
+
+          if (!(Test-Path $env:DM_GCC)) {
+            throw "GCC not available"
+          }
+
+          if (!(Test-Path "$env:DM_LLVM\bin\clang.exe")) {
+            throw "Clang not available"
+          }
+
+          python -m py_compile arrow/tools/build.py
+          python -m py_compile cheat/tools/build_cheat.py
+          python -m py_compile cheat/tools/make_rates_overlay.py
+          python -m py_compile cheat/tools/verify_overlay.py
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Python syntax validation failed"
+          }
+
+          Write-Host "Configuration validation passed"
+
       - name: Build arrow dylib
         shell: pwsh
+        env:
+          ARROW_DYLIB_ONLY: "1"
         run: |
-          $env:Path = ($env:Path -split ';' | Where-Object { $_ -notlike "*mingw*" }) -join ';'
-          $env:ARROW_DYLIB_ONLY = "1"
-          $env:DM_IPA_SRC = "$PWD\input\base.ipa"
-          if (-not $env:DM_LLVM) {
-              $env:DM_LLVM = "C:\Program Files\LLVM"
-          }
-          $llvmBin = "$env:DM_LLVM\bin"
-          $env:Path = "$llvmBin;$env:Path"
+          Write-Host "Building dmarrow.dylib..."
+
           python arrow/tools/build.py
-      - name: Build and inject cheat
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Arrow build failed"
+          }
+
+          if (!(Test-Path "arrow\out\dmarrow.dylib")) {
+            throw "dmarrow.dylib missing"
+          }
+
+          Write-Host "Arrow build successful"
+
+      - name: Build cheat and inject IPA
         shell: pwsh
         run: |
-          $env:Path = ($env:Path -split ';' | Where-Object { $_ -notlike "*mingw*" }) -join ';'
-          $env:DM_BASE_VER = $env:SHELL_TAG
-          $env:DM_IPA_SRC = "$PWD\input\base.ipa"
-          $env:DM_DIST = "$PWD\dist"
-          $env:DM_ARROW_DYLIB = "$PWD\arrow\out\dmarrow.dylib"
-          $env:DM_PHONE_DATA = "$PWD\resources\extracted\00-00000005.data"
-          $env:DM_MANIFEST = "$PWD\resources\extracted\build_manifest.psv"
-          $env:DM_RATES_OUT = "$PWD\cheat\out"
-          if (-not $env:DM_LLVM) {
-              $env:DM_LLVM = "C:\Program Files\LLVM"
-          }
-          $llvmBin = "$env:DM_LLVM\bin"
-          $env:Path = "$llvmBin;$env:Path"
+          Write-Host "Building dmcheat and final IPA..."
+
           python cheat/tools/build_cheat.py
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Cheat build or IPA injection failed"
+          }
+
+          Write-Host "Cheat build and injection successful"
+
       - name: Verify final IPA
         shell: pwsh
         run: |
-          $ipa = Get-ChildItem "dist\*.ipa" | Select-Object -First 1
+          $ipa = Get-ChildItem "dist\*-mods-1p.ipa" -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+
           if ($null -eq $ipa) {
-              throw "No IPA found in dist"
+            throw "Final IPA not found"
           }
+
           if ($ipa.Length -lt 10MB) {
-              throw "Generated IPA is too small, build may have failed"
+            throw "Final IPA is too small"
           }
-          Write-Host "Final IPA: $($ipa.FullName)"
-          Write-Host "Size: $([math]::Round($ipa.Length / 1MB, 2)) MB"
+
+          Write-Host "Final IPA:"
+          Write-Host $ipa.FullName
+
+          Write-Host "Size:"
+          Write-Host "$([math]::Round($ipa.Length / 1MB, 2)) MB"
+
+          @'
+          import sys
+          import zipfile
+          from pathlib import Path
+
+          files = list(Path("dist").glob("*-mods-1p.ipa"))
+
+          if len(files) != 1:
+              raise SystemExit("Expected exactly one final IPA")
+
+          required = {
+              "Payload/DmIOS.app/DmIOS",
+              "Payload/DmIOS.app/Frameworks/dmarrow.dylib",
+              "Payload/DmIOS.app/Frameworks/dmcheat.dylib",
+          }
+
+          with zipfile.ZipFile(files[0]) as z:
+              bad = z.testzip()
+              if bad:
+                  raise SystemExit("Corrupt ZIP entry: " + bad)
+
+              missing = required - set(z.namelist())
+
+              if missing:
+                  raise SystemExit(
+                      "Missing IPA entries: " + str(missing)
+                  )
+
+          print("IPA structure and CRC check passed")
+          '@ | python -
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "IPA archive validation failed"
+          }
+
+          python cheat/tools/check_final_ipa.py
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Final IPA content validation failed"
+          }
+
+          Write-Host "Final IPA validation passed"
+
       - name: Upload build artifacts
         if: success()
         uses: actions/upload-artifact@v4
@@ -255,3 +592,17 @@ jobs:
             dist/*.ipa
             dist/*.dylib
           retention-days: 7
+          if-no-files-found: error
+
+      - name: Upload build reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: d2r-build-reports
+          path: |
+            arrow/out/build_report.txt
+            cheat/out/build_report.txt
+            cheat/out/overlay_build_report.txt
+            cheat/out/overlay/overlay_manifest.txt
+          retention-days: 7
+          if-no-files-found: ignore
