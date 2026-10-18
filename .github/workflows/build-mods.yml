@@ -11,7 +11,7 @@ on:
         description: "Base IPA filename, use version without ios18 suffix for iOS 26"
         default: "D2RMobile-v1.0.18-build.10.1.ipa"
 
-      resources_url:https://github.com/zmw121/d2r-mobile-mods2/releases/download/mods-resources/mods-resources.zip
+      resources_url: https://github.com/zmw121/d2r-mobile-mods2/releases/download/mods-resources/mods-resources.zip
         description: "Optional: ZIP URL containing 00-00000005.data and build_manifest.psv"
         default: ""
 
@@ -77,12 +77,10 @@ jobs:
               "build_manifest.psv",
           }
 
-          # Check if already present
           if all((extracted / n).is_file() for n in wanted):
               print("Resources already present")
               sys.exit(0)
 
-          # Try Google Drive first
           import subprocess
           gdrive_ok = False
           try:
@@ -116,7 +114,6 @@ jobs:
               print("Resources from Google Drive")
               sys.exit(0)
 
-          # Fallback to custom URL
           url = os.environ.get("RESOURCES_URL", "").strip()
           if url:
               print("Trying custom URL: " + url)
