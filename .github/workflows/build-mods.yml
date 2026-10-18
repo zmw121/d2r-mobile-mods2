@@ -21,6 +21,11 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 120
 
+    env:
+      SHELL_TAG: ${{ inputs.shell_tag }}
+      SHELL_ASSET: ${{ inputs.shell_asset }}
+      DATA_TAG: ${{ inputs.data_tag }}
+
     steps:
       - name: 检出源码
         uses: actions/checkout@v4
