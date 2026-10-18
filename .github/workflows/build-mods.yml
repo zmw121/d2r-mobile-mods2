@@ -158,14 +158,18 @@ jobs:
               print("Patched: " + path)
           patch("arrow/tools/build.py", [
               (r"^LLVM\s*=.*$", "LLVM = os.environ.get('DM_LLVM', r'C:/Program Files/LLVM')"),
-              (r"^CLANG\s*=.*$", "CLANG = os.path.join(LLVM, 'bin', 'clang') + ' -fuse-ld=lld'"),
+              (r"^CLANG\s*=.*$", "CLANG = os.path.join(LLVM, 'bin', 'clang.exe')"),
+              (r"^NM\s*=.*$", "NM = os.path.join(LLVM, 'bin', 'llvm-nm.exe')"),
+              (r"^AR\s*=.*$", "AR = os.path.join(LLVM, 'bin', 'llvm-ar.exe')"),
               (r"^IPA_ROOT_DST\s*=.*$", "IPA_ROOT_DST = os.path.join(os.environ.get('DM_DIST', 'dist'), 'D2RMobile-arrow.ipa')"),
               (r"^ROOT_DYLIB_DST\s*=.*$", "ROOT_DYLIB_DST = os.path.join(os.environ.get('DM_DIST', 'dist'), 'dmarrow.dylib')"),
               (r"^OUT_IPA_NAME\s*=.*$", "OUT_IPA_NAME = 'D2RMobile-arrow.ipa'"),
           ])
           patch("cheat/tools/build_cheat.py", [
               (r"^LLVM\s*=.*$", "LLVM = os.environ.get('DM_LLVM', r'C:/Program Files/LLVM')"),
-              (r"^CLANG\s*=.*$", "CLANG = os.path.join(LLVM, 'bin', 'clang') + ' -fuse-ld=lld'"),
+              (r"^CLANG\s*=.*$", "CLANG = os.path.join(LLVM, 'bin', 'clang.exe')"),
+              (r"^NM\s*=.*$", "NM = os.path.join(LLVM, 'bin', 'llvm-nm.exe')"),
+              (r"^AR\s*=.*$", "AR = os.path.join(LLVM, 'bin', 'llvm-ar.exe')"),
               (r"^PYTHON\s*=.*$", "PYTHON = sys.executable"),
               (r"^BASE_VER\s*=.*$", "BASE_VER = os.environ.get('DM_BASE_VER', 'v1.0.18')"),
               (r"^IPA_SRC\s*=.*$", "IPA_SRC = os.environ.get('DM_IPA_SRC', 'input/base.ipa')"),
