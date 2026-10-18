@@ -6,14 +6,12 @@ on:
       shell_tag:
         description: "Base IPA Release tag"
         default: "v1.0.18-build.10.1"
-
       shell_asset:
         description: "Base IPA filename, use version without ios18 suffix for iOS 26"
         default: "D2RMobile-v1.0.18-build.10.1.ipa"
-
-      resources_url: https://github.com/zmw121/d2r-mobile-mods2/releases/download/mods-resources/mods-resources.zip
+      resources_url:
         description: "Optional: ZIP URL containing 00-00000005.data and build_manifest.psv"
-        default: ""
+        default: "https://github.com/zmw121/d2r-mobile-mods2/releases/download/mods-resources/mods-resources.zip"
 
 permissions:
   contents: read
@@ -22,44 +20,36 @@ jobs:
   build:
     runs-on: windows-latest
     timeout-minutes: 180
-
     env:
       SHELL_TAG: ${{ inputs.shell_tag }}
       SHELL_ASSET: ${{ inputs.shell_asset }}
       RESOURCES_URL: ${{ inputs.resources_url }}
-
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
-
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-
       - name: Create directories
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path input, resources, dist | Out-Null
           New-Item -ItemType Directory -Force -Path resources\extracted | Out-Null
-
       - name: Download base IPA
         shell: pwsh
         run: |
           $url = "https://github.com/jiayx/d2r-mobile-build/releases/download/${env:SHELL_TAG}/${env:SHELL_ASSET}"
           Write-Host "Downloading base IPA: $url"
           Invoke-WebRequest -Uri $url -OutFile "input\base.ipa"
-
           if ((Get-Item "input\base.ipa").Length -lt 10MB) {
             throw "Downloaded base.ipa is too small, possibly a 404 page"
           }
-
       - name: Fetch resources
         shell: pwsh
         run: |
           python -m pip install --upgrade pip gdown
           New-Item -ItemType Directory -Force -Path resources\extracted | Out-Null
-
           @'
           import hashlib
           import os
@@ -67,20 +57,16 @@ jobs:
           import sys
           import zipfile
           from pathlib import Path
-
           root = Path("resources")
           extracted = root / "extracted"
           extracted.mkdir(parents=True, exist_ok=True)
-
           wanted = {
               "00-00000005.data",
               "build_manifest.psv",
           }
-
           if all((extracted / n).is_file() for n in wanted):
               print("Resources already present")
               sys.exit(0)
-
           import subprocess
           gdrive_ok = False
           try:
@@ -91,11 +77,9 @@ jobs:
                   "-O", str(root / "gdrive")
               ], check=True, timeout=300)
               gdrive = root / "gdrive"
-
               def find_one(filename):
                   matches = list(gdrive.rglob(filename))
                   return matches[0] if matches else None
-
               gdrive_ok = True
               for name in wanted:
                   src = find_one(name)
@@ -104,23 +88,19 @@ jobs:
                       print("From GDrive: " + name)
                   else:
                       gdrive_ok = False
-
               shutil.rmtree(gdrive, ignore_errors=True)
           except Exception as e:
               print("GDrive failed: " + str(e))
               gdrive_ok = False
-
           if gdrive_ok:
               print("Resources from Google Drive")
               sys.exit(0)
-
           url = os.environ.get("RESOURCES_URL", "").strip()
           if url:
               print("Trying custom URL: " + url)
               import urllib.request
               zip_path = root / "resources.zip"
               urllib.request.urlretrieve(url, zip_path)
-
               with zipfile.ZipFile(zip_path) as z:
                   for info in z.infolist():
                       base = os.path.basename(info.filename)
@@ -128,43 +108,30 @@ jobs:
                           with z.open(info) as src, open(extracted / base, "wb") as dst:
                               shutil.copyfileobj(src, dst, 16 * 1024 * 1024)
                           print("From custom ZIP: " + base)
-
               zip_path.unlink(missing_ok=True)
-
           missing = [n for n in wanted if not (extracted / n).is_file()]
           if missing:
               raise SystemExit(
                   "Missing: " + ", ".join(missing) +
                   ". Wait 24h for GDrive quota, or provide resources_url."
               )
-
           print("Resources ready")
           '@ | python -
-
       - name: Install LLVM
         shell: pwsh
         run: |
           choco install llvm --yes
-
           $llvmBin = "C:\Program Files\LLVM\bin"
-
           if (!(Test-Path "$llvmBin\clang.exe")) {
               $clang = Get-Command clang.exe
               $llvmBin = Split-Path $clang.Source
           }
-
           $llvmRoot = Split-Path $llvmBin
           $env:Path = "$llvmBin;$env:Path"
           $env:DM_LLVM = $llvmRoot
-
-          "DM_LLVM=$llvmRoot" | Out-File `
-            -FilePath $env:GITHUB_ENV `
-            -Append `
-            -Encoding utf8
-
+          "DM_LLVM=$llvmRoot" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           Write-Host "LLVM: $llvmRoot"
           clang --version
-
       - name: Patch source paths and generate audit TBD
         shell: pwsh
         run: |
@@ -175,168 +142,72 @@ jobs:
           $env:DM_PHONE_DATA = "$PWD\resources\extracted\00-00000005.data"
           $env:DM_MANIFEST = "$PWD\resources\extracted\build_manifest.psv"
           $env:DM_RATES_OUT = "$PWD\cheat\out"
-
           @'
           import os
           import re
           from pathlib import Path
-
           root = Path.cwd()
-
           def patch(path, replacements):
               p = root / path
               s = p.read_text(encoding="utf-8-sig")
-
               for pattern, repl in replacements:
-                  s, n = re.subn(
-                      pattern,
-                      repl,
-                      s,
-                      count=1,
-                      flags=re.M
-                  )
+                  s, n = re.subn(pattern, repl, s, count=1, flags=re.M)
                   if n != 1:
-                      raise SystemExit(
-                          f"Failed to patch {path}: {pattern}"
-                      )
-
+                      raise SystemExit(f"Failed to patch {path}: {pattern}")
               p.write_text(s, encoding="utf-8")
               print("Patched: " + path)
-
           patch("arrow/tools/build.py", [
-              (
-                  r"^LLVM\s*=.*$",
-                  "LLVM = os.environ.get('DM_LLVM', r'C:/Program Files/LLVM')"
-              ),
-              (
-                  r"^IPA_ROOT_DST\s*=.*$",
-                  "IPA_ROOT_DST = os.path.join(os.environ.get('DM_DIST', 'dist'), 'D2RMobile-arrow.ipa')"
-              ),
-              (
-                  r"^ROOT_DYLIB_DST\s*=.*$",
-                  "ROOT_DYLIB_DST = os.path.join(os.environ.get('DM_DIST', 'dist'), 'dmarrow.dylib')"
-              ),
-              (
-                  r"^OUT_IPA_NAME\s*=.*$",
-                  "OUT_IPA_NAME = 'D2RMobile-arrow.ipa'"
-              ),
+              (r"^LLVM\s*=.*$", "LLVM = os.environ.get('DM_LLVM', r'C:/Program Files/LLVM')"),
+              (r"^IPA_ROOT_DST\s*=.*$", "IPA_ROOT_DST = os.path.join(os.environ.get('DM_DIST', 'dist'), 'D2RMobile-arrow.ipa')"),
+              (r"^ROOT_DYLIB_DST\s*=.*$", "ROOT_DYLIB_DST = os.path.join(os.environ.get('DM_DIST', 'dist'), 'dmarrow.dylib')"),
+              (r"^OUT_IPA_NAME\s*=.*$", "OUT_IPA_NAME = 'D2RMobile-arrow.ipa'"),
           ])
-
           patch("cheat/tools/build_cheat.py", [
-              (
-                  r"^LLVM\s*=.*$",
-                  "LLVM = os.environ.get('DM_LLVM', r'C:/Program Files/LLVM')"
-              ),
-              (
-                  r"^PYTHON\s*=.*$",
-                  "PYTHON = sys.executable"
-              ),
-              (
-                  r"^BASE_VER\s*=.*$",
-                  "BASE_VER = os.environ.get('DM_BASE_VER', 'v1.0.18')"
-              ),
-              (
-                  r"^IPA_SRC\s*=.*$",
-                  "IPA_SRC = os.environ.get('DM_IPA_SRC', 'input/base.ipa')"
-              ),
-              (
-                  r"^IPA_ROOT_DST\s*=.*$",
-                  "IPA_ROOT_DST = os.path.join(os.environ.get('DM_DIST', 'dist'), 'D2RMobile-' + BASE_VER + '-mods-1p.ipa')"
-              ),
-              (
-                  r"^ROOT_DYLIB_DST\s*=.*$",
-                  "ROOT_DYLIB_DST = os.path.join(os.environ.get('DM_DIST', 'dist'), 'dmcheat.dylib')"
-              ),
-              (
-                  r"^ARROW_ROOT_DST\s*=.*$",
-                  "ARROW_ROOT_DST = os.path.join(os.environ.get('DM_DIST', 'dist'), 'dmarrow.dylib')"
-              ),
-              (
-                  r"^ARROW_DYLIB\s*=.*$",
-                  "ARROW_DYLIB = os.environ.get('DM_ARROW_DYLIB', 'arrow/out/dmarrow.dylib')"
-              ),
-              (
-                  r"^OUT_IPA_NAME\s*=.*$",
-                  "OUT_IPA_NAME = 'D2RMobile-' + BASE_VER + '-mods-1p.ipa'"
-              ),
+              (r"^LLVM\s*=.*$", "LLVM = os.environ.get('DM_LLVM', r'C:/Program Files/LLVM')"),
+              (r"^PYTHON\s*=.*$", "PYTHON = sys.executable"),
+              (r"^BASE_VER\s*=.*$", "BASE_VER = os.environ.get('DM_BASE_VER', 'v1.0.18')"),
+              (r"^IPA_SRC\s*=.*$", "IPA_SRC = os.environ.get('DM_IPA_SRC', 'input/base.ipa')"),
+              (r"^IPA_ROOT_DST\s*=.*$", "IPA_ROOT_DST = os.path.join(os.environ.get('DM_DIST', 'dist'), 'D2RMobile-' + BASE_VER + '-mods-1p.ipa')"),
+              (r"^ROOT_DYLIB_DST\s*=.*$", "ROOT_DYLIB_DST = os.path.join(os.environ.get('DM_DIST', 'dist'), 'dmcheat.dylib')"),
+              (r"^ARROW_ROOT_DST\s*=.*$", "ARROW_ROOT_DST = os.path.join(os.environ.get('DM_DIST', 'dist'), 'dmarrow.dylib')"),
+              (r"^ARROW_DYLIB\s*=.*$", "ARROW_DYLIB = os.environ.get('DM_ARROW_DYLIB', 'arrow/out/dmarrow.dylib')"),
+              (r"^OUT_IPA_NAME\s*=.*$", "OUT_IPA_NAME = 'D2RMobile-' + BASE_VER + '-mods-1p.ipa'"),
           ])
-
           patch("cheat/tools/make_rates_overlay.py", [
-              (
-                  r"^PHONE_DATA\s*=.*$",
-                  "PHONE_DATA = os.environ.get('DM_PHONE_DATA', 'resources/extracted/00-00000005.data')"
-              ),
-              (
-                  r"^MANIFEST\s*=.*$",
-                  "MANIFEST = os.environ.get('DM_MANIFEST', 'resources/extracted/build_manifest.psv')"
-              ),
-              (
-                  r"^OUT\s*=.*$",
-                  "OUT = os.environ.get('DM_RATES_OUT', os.path.abspath('cheat/out'))"
-              ),
+              (r"^PHONE_DATA\s*=.*$", "PHONE_DATA = os.environ.get('DM_PHONE_DATA', 'resources/extracted/00-00000005.data')"),
+              (r"^MANIFEST\s*=.*$", "MANIFEST = os.environ.get('DM_MANIFEST', 'resources/extracted/build_manifest.psv')"),
+              (r"^OUT\s*=.*$", "OUT = os.environ.get('DM_RATES_OUT', os.path.abspath('cheat/out'))"),
           ])
-
           p = root / "cheat/tools/build_cheat.py"
           s = p.read_text(encoding="utf-8")
-
-          m = re.search(
-              r"^SYM_LIBS\s*=\s*\{(.*?)^\}",
-              s,
-              re.S | re.M
-          )
-
+          m = re.search(r"^SYM_LIBS\s*=\s*\{(.*?)^\}", s, re.S | re.M)
           if not m:
               raise SystemExit("SYM_LIBS not found")
-
-          pairs = re.findall(
-              r"'(_[^']+)'\s*:\s*(LIB_\w+)",
-              m.group(1)
-          )
-
+          pairs = re.findall(r"'(_[^']+)'\s*:\s*(LIB_\w+)", m.group(1))
           files = {
               "LIB_SYSTEM": "libSystem.B.tbd",
               "LIB_OBJC": "libobjc.A.tbd",
               "LIB_FOUNDATION": "Foundation.tbd",
           }
-
           tbd_dir = root / "arrow/tools/ios27_tbds"
           tbd_dir.mkdir(parents=True, exist_ok=True)
-
           for lib, filename in files.items():
-              syms = sorted({
-                  sym
-                  for sym, target in pairs
-                  if target == lib
-              })
-
+              syms = sorted({sym for sym, target in pairs if target == lib})
               if not syms:
-                  raise SystemExit(
-                      f"No symbols for {lib} in SYM_LIBS"
-                  )
-
+                  raise SystemExit(f"No symbols for {lib} in SYM_LIBS")
               target = tbd_dir / filename
-              target.write_text(
-                  "\n".join(syms) + "\n",
-                  encoding="utf-8"
-              )
-
-              print(
-                  f"Generated audit TBD: {target} ({len(syms)} symbols)"
-              )
+              target.write_text("\n".join(syms) + "\n", encoding="utf-8")
+              print(f"Generated audit TBD: {target} ({len(syms)} symbols)")
           '@ | python -
-
       - name: Build arrow dylib
         shell: pwsh
         run: |
           $env:ARROW_DYLIB_ONLY = "1"
           $env:DM_IPA_SRC = "$PWD\input\base.ipa"
-
           if (-not $env:DM_LLVM) {
               $env:DM_LLVM = "C:\Program Files\LLVM"
           }
-
           python arrow/tools/build.py
-
       - name: Build and inject cheat
         shell: pwsh
         run: |
@@ -347,29 +218,22 @@ jobs:
           $env:DM_PHONE_DATA = "$PWD\resources\extracted\00-00000005.data"
           $env:DM_MANIFEST = "$PWD\resources\extracted\build_manifest.psv"
           $env:DM_RATES_OUT = "$PWD\cheat\out"
-
           if (-not $env:DM_LLVM) {
               $env:DM_LLVM = "C:\Program Files\LLVM"
           }
-
           python cheat/tools/build_cheat.py
-
       - name: Verify final IPA
         shell: pwsh
         run: |
           $ipa = Get-ChildItem "dist\*.ipa" | Select-Object -First 1
-
           if ($null -eq $ipa) {
               throw "No IPA found in dist"
           }
-
           if ($ipa.Length -lt 10MB) {
               throw "Generated IPA is too small, build may have failed"
           }
-
           Write-Host "Final IPA: $($ipa.FullName)"
           Write-Host "Size: $([math]::Round($ipa.Length / 1MB, 2)) MB"
-
       - name: Upload build artifacts
         if: success()
         uses: actions/upload-artifact@v4
