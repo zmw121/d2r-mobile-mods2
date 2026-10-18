@@ -1,0 +1,316 @@
+name: Build D2R Mobile Mods
+
+on:
+  workflow_dispatch:
+    inputs:
+      shell_tag:
+        description: "基础 IPA Release 标签"
+        default: "v1.0.18-build.10.1"
+      shell_asset:
+        description: "基础 IPA 文件名"
+        default: "D2RMobile-v1.0.18-build.10.1.ipa"
+      data_tag:
+        description: "资源 Release 标签"
+        default: "data-3.3.94012-97a2ada74145114ff8364bdc51a756408ef0c6d332e58fefe68eb0ee2b7c4a31"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: 创建目录
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path input, resources, dist | Out-Null
+          New-Item -ItemType Directory -Force -Path resources\extracted | Out-Null
+
+      - name: 下载基础 IPA
+        shell: pwsh
+        run: |
+          $url = "https://github.com/jiayx/d2r-mobile-build/releases/download/${env:SHELL_TAG}/${env:SHELL_ASSET}"
+          Write-Host "下载基础 IPA：$url"
+          Invoke-WebRequest -Uri $url -OutFile "input\base.ipa"
+
+      - name: 下载资源分卷
+        shell: pwsh
+        run: |
+          $base = "https://github.com/jiayx/d2r-mobile-build/releases/download/${env:DATA_TAG}"
+          $files = @(
+            "D2R-Mobile-Resources.zip.001",
+            "D2R-Mobile-Resources.zip.002",
+            "D2R-Mobile-Resources.zip.003",
+            "Resources-Parts-SHA256SUMS.txt",
+            "Resources-SHA256SUMS.txt",
+            "RESOURCE-INSTALL.txt"
+          )
+
+          foreach ($f in $files) {
+            Write-Host "下载 $f"
+            Invoke-WebRequest -Uri "$base/$f" -OutFile "resources\$f"
+          }
+
+      - name: 校验资源分卷
+        shell: pwsh
+        run: |
+          function Assert-Sha256([string]$Path, [string]$Expected) {
+            $actual = (Get-FileHash -Algorithm SHA256 -Path $Path).Hash.ToLowerInvariant()
+            if ($actual -ne $Expected.ToLowerInvariant()) {
+              throw "SHA256 不一致：$Path`n实际：$actual`n预期：$Expected"
+            }
+            Write-Host "SHA256 OK：$Path"
+          }
+
+          $parts = @(
+            "D2R-Mobile-Resources.zip.001",
+            "D2R-Mobile-Resources.zip.002",
+            "D2R-Mobile-Resources.zip.003"
+          )
+
+          $expected = @{}
+          Select-String -Path "resources\Resources-Parts-SHA256SUMS.txt" `
+            -Pattern '^([0-9a-fA-F]{64})\s+\*?(.+)$' | ForEach-Object {
+              $expected[$_.Matches[0].Groups[2].Value.Trim()] =
+                $_.Matches[0].Groups[1].Value.ToLowerInvariant()
+            }
+
+          foreach ($f in $parts) {
+            if (-not $expected.ContainsKey($f)) {
+              throw "校验文件中没有 $f 的 SHA256"
+            }
+            Assert-Sha256 "resources\$f" $expected[$f]
+          }
+
+      - name: 合并资源 ZIP
+        shell: pwsh
+        run: |
+          $parts = @(
+            "resources\D2R-Mobile-Resources.zip.001",
+            "resources\D2R-Mobile-Resources.zip.002",
+            "resources\D2R-Mobile-Resources.zip.003"
+          )
+          $merged = "resources\D2R-Mobile-Resources.zip"
+
+          $out = [System.IO.File]::Create($merged)
+          foreach ($p in $parts) {
+            Write-Host "合并 $p"
+            $in = [System.IO.File]::OpenRead($p)
+            $in.CopyTo($out)
+            $in.Dispose()
+          }
+          $out.Dispose()
+
+          foreach ($p in $parts) {
+            Remove-Item $p -Force
+          }
+
+      - name: 校验合并后的 ZIP
+        shell: pwsh
+        run: |
+          $line = Select-String -Path "resources\Resources-SHA256SUMS.txt" `
+            -Pattern '^([0-9a-fA-F]{64})' | Select-Object -First 1
+
+          if ($null -eq $line) {
+            throw "Resources-SHA256SUMS.txt 中没有找到 SHA256"
+          }
+
+          $expected = $line.Matches[0].Groups[1].Value.ToLowerInvariant()
+          $actual = (Get-FileHash -Algorithm SHA256 `
+            -Path "resources\D2R-Mobile-Resources.zip").Hash.ToLowerInvariant()
+
+          Write-Host "预期：$expected"
+          Write-Host "实际：$actual"
+
+          if ($actual -ne $expected) {
+            throw "合并后的 D2R-Mobile-Resources.zip 校验失败"
+          }
+
+      - name: 只提取爆率覆盖层需要的文件
+        shell: pwsh
+        run: |
+          @'
+          import os
+          import shutil
+          import zipfile
+
+          zip_path = r"resources\D2R-Mobile-Resources.zip"
+          out_dir = r"resources\extracted"
+          wanted = {
+              "00-00000005.data",
+              "build_manifest.psv",
+          }
+
+          found = set()
+          with zipfile.ZipFile(zip_path) as z:
+              for info in z.infolist():
+                  base = os.path.basename(info.filename)
+                  if base in wanted:
+                      target = os.path.join(out_dir, base)
+                      with z.open(info) as src, open(target, "wb") as dst:
+                          shutil.copyfileobj(src, dst)
+                      print("已提取:", info.filename)
+                      found.add(base)
+
+          missing = wanted - found
+          if missing:
+              raise SystemExit("ZIP 中缺少文件: " + ", ".join(sorted(missing)))
+          '@ | python -
+
+          Remove-Item "resources\D2R-Mobile-Resources.zip" -Force
+
+      - name: 安装 LLVM
+        shell: pwsh
+        run: |
+          choco install llvm --yes
+
+          $llvmBin = "C:\Program Files\LLVM\bin"
+          if (!(Test-Path "$llvmBin\clang.exe")) {
+            $clang = Get-Command clang.exe
+            $llvmBin = Split-Path $clang.Source
+          }
+
+          $env:Path = "$llvmBin;$env:Path"
+          $env:DM_LLVM = Split-Path $llvmBin
+
+          Write-Host "LLVM: $env:DM_LLVM"
+          clang --version
+
+      - name: 修正源码中的本机路径
+        shell: pwsh
+        run: |
+          $env:DM_BASE_VER = $env:SHELL_TAG
+          $env:DM_IPA_SRC = "$PWD\input\base.ipa"
+          $env:DM_DIST = "$PWD\dist"
+          $env:DM_ARROW_DYLIB = "$PWD\arrow\out\dmarrow.dylib"
+          $env:DM_PHONE_DATA = "$PWD\resources\extracted\00-00000005.data"
+          $env:DM_MANIFEST = "$PWD\resources\extracted\build_manifest.psv"
+          $env:DM_RATES_OUT = "$PWD\cheat\out"
+
+          @'
+          import os
+          import re
+          from pathlib import Path
+
+          root = Path.cwd()
+
+          def patch(path, replacements):
+              p = root / path
+              s = p.read_text(encoding="utf-8-sig")
+              for pattern, repl in replacements:
+                  s, n = re.subn(pattern, repl, s, count=1, flags=re.M)
+                  if n != 1:
+                      raise SystemExit(f"未能修补 {path}: {pattern}")
+              p.write_text(s, encoding="utf-8")
+              print("已修补:", path)
+
+          patch("arrow/tools/build.py", [
+              (r"^LLVM\s*=.*$",
+               "LLVM = os.environ.get('DM_LLVM', r'C:/Program Files/LLVM')"),
+              (r"^IPA_ROOT_DST\s*=.*$",
+               "IPA_ROOT_DST = os.path.join(os.environ.get('DM_DIST', 'dist'), 'D2RMobile-arrow.ipa')"),
+              (r"^ROOT_DYLIB_DST\s*=.*$",
+               "ROOT_DYLIB_DST = os.path.join(os.environ.get('DM_DIST', 'dist'), 'dmarrow.dylib')"),
+              (r"^OUT_IPA_NAME\s*=.*$",
+               "OUT_IPA_NAME = 'D2RMobile-arrow.ipa'"),
+          ])
+
+          patch("cheat/tools/build_cheat.py", [
+              (r"^LLVM\s*=.*$",
+               "LLVM = os.environ.get('DM_LLVM', r'C:/Program Files/LLVM')"),
+              (r"^PYTHON\s*=.*$",
+               "PYTHON = sys.executable"),
+              (r"^BASE_VER\s*=.*$",
+               "BASE_VER = os.environ.get('DM_BASE_VER', 'v1.0.18')"),
+              (r"^IPA_SRC\s*=.*$",
+               "IPA_SRC = os.environ.get('DM_IPA_SRC', 'input/base.ipa')"),
+              (r"^IPA_ROOT_DST\s*=.*$",
+               "IPA_ROOT_DST = os.path.join(os.environ.get('DM_DIST', 'dist'), 'D2RMobile-' + BASE_VER + '-mods-1p.ipa')"),
+              (r"^ROOT_DYLIB_DST\s*=.*$",
+               "ROOT_DYLIB_DST = os.path.join(os.environ.get('DM_DIST', 'dist'), 'dmcheat.dylib')"),
+              (r"^ARROW_ROOT_DST\s*=.*$",
+               "ARROW_ROOT_DST = os.path.join(os.environ.get('DM_DIST', 'dist'), 'dmarrow.dylib')"),
+              (r"^ARROW_DYLIB\s*=.*$",
+               "ARROW_DYLIB = os.environ.get('DM_ARROW_DYLIB', 'arrow/out/dmarrow.dylib')"),
+              (r"^OUT_IPA_NAME\s*=.*$",
+               "OUT_IPA_NAME = 'D2RMobile-' + BASE_VER + '-mods-1p.ipa'"),
+          ])
+
+          patch("cheat/tools/make_rates_overlay.py", [
+              (r"^PHONE_DATA\s*=.*$",
+               "PHONE_DATA = os.environ.get('DM_PHONE_DATA', 'resources/extracted/00-00000005.data')"),
+              (r"^MANIFEST\s*=.*$",
+               "MANIFEST = os.environ.get('DM_MANIFEST', 'resources/extracted/build_manifest.psv')"),
+              (r"^OUT\s*=.*$",
+               "OUT = os.environ.get('DM_RATES_OUT', os.path.abspath('cheat/out'))"),
+          ])
+
+          # 原仓库引用了 ios27_tbds，但没有随仓库提供。
+          # 这里的 tbd 只用于符号存在性审计，因此生成包含全部登记符号的审计文件。
+          p = root / "cheat/tools/build_cheat.py"
+          s = p.read_text(encoding="utf-8")
+          m = re.search(r"^SYM_LIBS\s*=\s*\{(.*?)^\}", s, re.S | re.M)
+          if not m:
+              raise SystemExit("没有找到 SYM_LIBS")
+
+          pairs = re.findall(r"'(_[^']+)'\s*:\s*(LIB_\w+)", m.group(1))
+          files = {
+              "LIB_SYSTEM": "libSystem.B.tbd",
+              "LIB_OBJC": "libobjc.A.tbd",
+              "LIB_FOUNDATION": "Foundation.tbd",
+          }
+
+          tbd_dir = root / "arrow/tools/ios27_tbds"
+          tbd_dir.mkdir(parents=True, exist_ok=True)
+
+          for lib, filename in files.items():
+              syms = sorted({sym for sym, target in pairs if target == lib})
+              if not syms:
+                  raise SystemExit(f"SYM_LIBS 中没有 {lib} 的符号")
+              target = tbd_dir / filename
+              target.write_text("\n".join(syms) + "\n", encoding="utf-8")
+              print(f"生成审计 TBD: {target} ({len(syms)} 个符号)")
+          '@ | python -
+
+      - name: 构建任务箭头 dylib
+        shell: pwsh
+        run: |
+          $env:ARROW_DYLIB_ONLY = "1"
+          $env:DM_IPA_SRC = "$PWD\input\base.ipa"
+          $env:DM_LLVM = "C:\Program Files\LLVM"
+
+          python arrow/tools/build.py
+
+      - name: 构建并注入金手指
+        shell: pwsh
+        run: |
+          $env:DM_BASE_VER = $env:SHELL_TAG
+          $env:DM_IPA_SRC = "$PWD\input\base.ipa"
+          $env:DM_DIST = "$PWD\dist"
+          $env:DM_ARROW_DYLIB = "$PWD\arrow\out\dmarrow.dylib"
+          $env:DM_PHONE_DATA = "$PWD\resources\extracted\00-00000005.data"
+          $env:DM_MANIFEST = "$PWD\resources\extracted\build_manifest.psv"
+          $env:DM_RATES_OUT = "$PWD\cheat\out"
+          $env:DM_LLVM = "C:\Program Files\LLVM"
+
+          python cheat/tools/build_cheat.py
+
+      - name: 上传构建产物
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: d2r-mobile-mods
+          path: |
+            dist/*.ipa
+            dist/*.dylib
+          retention-days: 7
